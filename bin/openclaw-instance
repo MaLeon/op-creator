@@ -1,0 +1,649 @@
+#!/usr/bin/env bash
+# Linux, Bash 5. No command output containing configuration/secrets is persisted.
+# jq programs deliberately use single quotes and jq variables, not shell expansion.
+# shellcheck disable=SC2016
+set +x
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C
+
+die() { printf '错误: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*" >&2; }
+usage() {
+    cat <<'EOF'
+openclaw-instance — 普通用户的 OpenClaw 实例管理器
+  preflight
+  create NAME
+  list [--json]
+  status NAME [--json]
+  start|stop|restart NAME
+  logs NAME [-f]
+  configure|doctor|remove NAME
+  purge NAME --confirm NAME
+状态目录: ~/.local/state/openclaw-instance-manager
+remove 保留数据和端口；purge 永久删除数据。只操作受管实例。
+EOF
+}
+valid_name() { [[ $1 =~ ^[a-z][a-z0-9-]{0,31}$ && $1 != default && $1 != dev ]]; }
+
+command_name=${1:-help}
+shift || true
+case $command_name in
+    help|--help|-h) usage; exit 0 ;;
+    preflight) (($# == 0)) || die 'preflight 不接受参数' ;;
+    list) (($# == 0)) || [[ $# == 1 && $1 == --json ]] || die '用法: list [--json]' ;;
+    create|start|stop|restart|configure|doctor|remove) (($# == 1)) || die '该命令需要一个实例名称' ;;
+    status) [[ $# == 1 || ( $# == 2 && $2 == --json ) ]] || die '用法: status NAME [--json]' ;;
+    logs) [[ $# == 1 || ( $# == 2 && $2 == -f ) ]] || die '用法: logs NAME [-f]' ;;
+    purge) [[ $# == 3 && $2 == --confirm && $1 == "$3" ]] || die '用法: purge NAME --confirm NAME' ;;
+    *) die "未知命令: $command_name" ;;
+esac
+name=${1:-}
+case $command_name in preflight|list) ;; *) valid_name "$name" || die '名称须为小写字母开头的 1–32 位小写字母、数字或连字符；default/dev 保留' ;; esac
+
+(( BASH_VERSINFO[0] >= 5 )) || die '需要 Bash 5+'
+[[ $(uname -s) == Linux ]] || die '仅支持 Linux/systemd；macOS 可运行 tests 中的容器测试'
+(( EUID != 0 )) || die '请使用专用普通用户运行，不要使用 root/sudo'
+for dep in jq flock ss systemctl loginctl node openclaw stat realpath timeout sha256sum find mountpoint; do
+    command -v "$dep" >/dev/null || die "缺少依赖: $dep"
+done
+[[ ${HOME:-} == /* && $HOME != / && $HOME != *$'\n'* ]] || die 'HOME 必须是非根目录的绝对路径'
+user_home=$(realpath -e -- "$HOME")
+[[ $user_home == "$HOME" && $(stat -c %u "$user_home") == "$EUID" ]] || die 'HOME 必须是本人拥有的真实目录，不能是符号链接'
+owner=$(id -un)
+manager="$user_home/.local/state/openclaw-instance-manager"
+registry="$manager/instances.json"
+state="$user_home/.openclaw-$name"
+unit="openclaw-gateway-$name.service"
+for var in OPENCLAW_HOME OPENCLAW_STATE_DIR OPENCLAW_CONFIG_PATH OPENCLAW_PROFILE \
+    OPENCLAW_GATEWAY_PORT OPENCLAW_GATEWAY_TOKEN OPENCLAW_GATEWAY_PASSWORD \
+    OPENCLAW_SYSTEMD_UNIT OPENCLAW_LAUNCHD_LABEL OPENCLAW_WINDOWS_TASK_NAME \
+    OPENCLAW_WRAPPER OPENCLAW_NIX_MODE OPENCLAW_GATEWAY_URL OPENCLAW_SERVICE_KIND \
+    OPENCLAW_ALLOW_MULTI_GATEWAY; do
+    [[ -z ${!var:-} ]] || die "请先取消环境变量 $var（其值不会显示）"
+done
+[[ -z ${XDG_CONFIG_HOME:-} || $XDG_CONFIG_HOME == "$user_home/.config" ]] || die '第一版要求默认 XDG_CONFIG_HOME'
+[[ -z ${XDG_STATE_HOME:-} || $XDG_STATE_HOME == "$user_home/.local/state" ]] || die '第一版要求默认 XDG_STATE_HOME'
+[[ -z ${XDG_RUNTIME_DIR:-} ]] && export XDG_RUNTIME_DIR="/run/user/$EUID"
+
+# Do not follow symlinks in any managed path component, including missing leaves.
+safe_path() {
+    local path=$1 cursor=$1
+    [[ $path == "$user_home/"* ]] || return 1
+    while [[ $cursor != "$user_home" ]]; do
+        [[ ! -L $cursor ]] || return 1
+        if [[ -e $cursor ]]; then [[ $(stat -c %u "$cursor") == "$EUID" ]] || return 1; fi
+        cursor=${cursor%/*}
+    done
+}
+private_path() {
+    local mode
+    safe_path "$1" || return 1
+    mode=$(stat -c %a "$1") || return 1
+    (( (8#$mode & 077) == 0 ))
+}
+validate_registry() {
+    [[ -f $registry ]] && private_path "$registry" && private_path "$manager" || return 1
+    jq -e --arg home "$user_home" --arg owner "$owner" --argjson uid "$EUID" '
+      .schemaVersion == 1 and .owner == $owner and .uid == $uid and
+      (.instances | type == "object") and
+      (.instances | to_entries | all(
+        .key as $n | .value as $v |
+        ($n | test("^[a-z][a-z0-9-]{0,31}$")) and $n != "dev" and $n != "default" and
+        $v.profile == $n and $v.owner == $owner and $v.uid == $uid and
+        $v.stateDir == ($home + "/.openclaw-" + $n) and
+        $v.workspace == ($v.stateDir + "/workspace") and
+        $v.configPath == ($v.stateDir + "/openclaw.json") and
+        $v.service == ("openclaw-gateway-" + $n + ".service") and
+        ($v.port | type == "number") and $v.port >= 19000 and (($v.port-19000)%200 == 0) and
+        $v.portEnd == ($v.port+199) and $v.portEnd <= 65535 and
+        (["creating","ready","failed","removed","deleting"] | index($v.state)) != null and
+        ($v.stage | type == "string") and ($v.createdAt | type == "string") and
+        ($v.openclawVersion | type == "string") and
+        ($v.configComplete | type == "boolean") and
+        ($v.ownerId | test("^[a-f0-9]{32}$")) and
+        ($v.serviceFingerprint == null or ($v.serviceFingerprint | test("^[a-f0-9]{64}$")))
+      )) and
+      ([.instances[].port] | length == (unique | length))
+    ' "$registry" >/dev/null 2>&1
+}
+require_registry() { validate_registry || die '注册表缺失、损坏或权限异常；请恢复备份，不会自动重建或认领实例'; }
+
+atomic_registry() {
+    local tmp
+    tmp=$(mktemp "$manager/.instances.XXXXXX") || return 1
+    if jq "$@" "$registry" >"$tmp" && chmod 600 "$tmp" && mv -f -- "$tmp" "$registry"; then return 0; fi
+    rm -f -- "$tmp"
+    return 1
+}
+init_manager() {
+    local fresh=0 ancestor=$manager fs
+    safe_path "$manager" || die '管理目录存在符号链接或所有者不符'
+    while [[ ! -e $ancestor ]]; do ancestor=${ancestor%/*}; done
+    fs=$(stat -f -c %T "$ancestor")
+    case $fs in ext2/ext3|xfs|btrfs|zfs|overlayfs|tmpfs) ;; *) die "管理目录须使用支持锁和原子重命名的本地文件系统，当前: $fs" ;; esac
+    mkdir -p -- "$user_home/.local/state"
+    # Serialize first-use mkdir too. Directory flock needs no bootstrap file.
+    exec 7<"$user_home/.local/state"
+    flock -x 7
+    if mkdir -- "$manager" 2>/dev/null; then fresh=1; fi
+    private_path "$manager" || die '管理目录须为本人拥有的 0700 目录'
+    safe_path "$manager/manager.lock" || die '锁文件不安全'
+    exec 9>>"$manager/manager.lock"
+    flock -x 9
+    if ((fresh)); then
+        jq -n --arg owner "$owner" --argjson uid "$EUID" \
+            '{schemaVersion:1,owner:$owner,uid:$uid,instances:{}}' >"$manager/.initial.json"
+        mv -- "$manager/.initial.json" "$registry"
+    fi
+    require_registry
+    flock -u 9
+    flock -u 7
+    exec 7<&-
+}
+lock_instance() {
+    safe_path "$manager/$name.lock" || die '实例锁路径不安全'
+    exec 8>>"$manager/$name.lock"
+    flock -x 8
+    flock -x 9
+    require_registry
+}
+entry() { jq -ce --arg n "$name" '.instances[$n] // empty' "$registry"; }
+record_stage() {
+    mutation_started=1
+    atomic_registry --arg n "$name" --arg stage "$1" \
+        '.instances[$n].stage=$stage | .instances[$n].lastError=null'
+}
+record_state() {
+    mutation_started=1
+    atomic_registry --arg n "$name" --arg s "$1" --arg stage "$2" \
+        '.instances[$n].state=$s | .instances[$n].stage=$stage | .instances[$n].lastError=null'
+}
+oc() { timeout 45 openclaw --profile "$name" "$@"; }
+oc_for() {
+    local profile=$1; shift
+    if [[ $profile == default ]]; then timeout 45 openclaw "$@"; else timeout 45 openclaw --profile "$profile" "$@"; fi
+}
+config_part() {
+    local profile=$1 path=$2 out
+    if out=$(oc_for "$profile" config get "$path" --json 2>/dev/null); then
+        jq -ce 'select(type == "object")' <<<"$out" 2>/dev/null
+    else
+        # Only an explicit unset-path result is optional; invalid config is fatal.
+        if jq -e --arg p "$path" '
+          (.error | if type=="object" then .message else . end) as $e |
+          ($e | type=="string") and ($e | startswith("Config path is valid but unset: " + $p + "."))
+        ' <<<"$out" >/dev/null 2>&1; then printf '{}\n'; else return 1; fi
+    fi
+}
+runtime_check() {
+    systemctl --user show-environment >/dev/null 2>&1 || die '无法连接 systemd 用户管理器；检查用户会话与 XDG_RUNTIME_DIR'
+    [[ $(loginctl show-user "$owner" -p Linger --value 2>/dev/null) == yes ]] || die "需由管理员先执行: sudo loginctl enable-linger $owner"
+}
+capabilities() {
+    local spec words output flag
+    for spec in 'setup|--baseline --workspace' 'config patch|--stdin' 'config get|--json' \
+        'config validate|--json' 'gateway install|--port' 'gateway status|--json --no-probe' \
+        'gateway stop|--force' 'gateway health|--json --port --timeout'; do
+        words=${spec%%|*}
+        local -a args
+        read -r -a args <<<"$words"
+        output=$(timeout 45 openclaw "${args[@]}" --help 2>/dev/null) || die "无法读取 CLI 能力: $words"
+        for flag in ${spec#*|}; do [[ $output == *"$flag"* ]] || die "当前 OpenClaw 不支持 $words $flag"; done
+    done
+    version=$(timeout 20 openclaw --version 2>/dev/null) || die '无法读取 OpenClaw 版本'
+    [[ $version =~ [0-9]{4}\.[0-9]+\.[0-9]+ ]] || die '无法识别 OpenClaw 版本'
+    version=${BASH_REMATCH[0]}
+}
+
+# All ranges include stopped services and reservations. Never parse credentials.
+ranges='[]'
+add_range() {
+    local low=$1 high=$2
+    [[ $low =~ ^[0-9]+$ && $high =~ ^[0-9]+$ ]] && ((low>0 && high<=65535 && high>=low)) || return 1
+    ranges=$(jq -c --argjson a "$low" --argjson b "$high" '.+[{a:$a,b:$b}]' <<<"$ranges")
+}
+browser_ranges() {
+    node -e '
+      let input=""; process.stdin.on("data",x=>input+=x); process.stdin.on("end",()=>{
+        try {
+          const b=JSON.parse(input), out=[];
+          function walk(o) {
+            if(!o || typeof o!=="object") return;
+            if(o.cdpPortRangeStart!=null || o.cdpPortRangeEnd!=null) {
+              const a=o.cdpPortRangeStart,b=o.cdpPortRangeEnd;
+              if(!Number.isInteger(a)||!Number.isInteger(b)||a<1||b>65535||a>b) throw Error();
+              out.push([a,b]);
+            }
+            for(const [k,v] of Object.entries(o)) {
+              if(/port$/i.test(k) && v!=null) {
+                if(!Number.isInteger(v)||v<1||v>65535) throw Error(); out.push([v,v]);
+              } else if(/cdpUrl$/i.test(k) && v) {
+                const u=new URL(v); if(!["http:","https:","ws:","wss:"].includes(u.protocol)) throw Error();
+                if(["localhost","127.0.0.1","[::1]","0.0.0.0","[::]"].includes(u.hostname)) {
+                  const p=Number(u.port || (/^(https|wss):$/.test(u.protocol)?443:80)); out.push([p,p]);
+                } else { throw Error(); } // Unknown remote/local DNS: fail closed.
+              } else walk(v);
+            }
+          }
+          walk(b); for(const pair of out) console.log(pair.join(" "));
+        } catch { process.exitCode=1; }
+      });
+    '
+}
+scan_ports() {
+    local exclude=${1:-} dir profile gateway browser base line low high output svc services status
+    ranges='[]'
+    if [[ -f $registry ]]; then
+        require_registry
+        ranges=$(jq -c --arg skip "$exclude" '[.instances[] | select(.profile!=$skip) | {a:.port,b:.portEnd}]' "$registry")
+    fi
+    shopt -s nullglob
+    for dir in "$user_home/.openclaw" "$user_home"/.openclaw-*; do
+        [[ -e $dir/openclaw.json || -L $dir/openclaw.json ]] || continue
+        profile=${dir##*/.openclaw-}
+        [[ $dir != "$user_home/.openclaw" ]] || profile=default
+        [[ $profile != "$exclude" ]] || continue
+        [[ $profile == default || $profile =~ ^[a-zA-Z0-9_-]+$ ]] || die '发现无法安全识别的已有 profile'
+        gateway=$(config_part "$profile" gateway) || die "无法解析已有 profile 的 gateway: $profile"
+        browser=$(config_part "$profile" browser) || die "无法解析已有 profile 的 browser: $profile"
+        base=$(jq -er '.port // 18789' <<<"$gateway")
+        [[ $base =~ ^[1-9][0-9]{0,4}$ ]] || die '已有 Gateway 端口无效'
+        ((base<=65425)) || die '已有 Gateway 端口无效'
+        add_range "$base" "$((base+110))" || die '已有 Gateway 端口无效'
+        output=$(browser_ranges <<<"$browser") || die "已有 profile 使用无法可靠判定的浏览器端口: $profile"
+        while read -r low high; do [[ -z $low ]] || add_range "$low" "$high"; done <<<"$output"
+    done
+    services=$(systemctl --user list-unit-files --no-legend --no-pager 2>/dev/null) || die '无法枚举已有用户服务'
+    while read -r svc _; do
+        [[ -n $svc ]] || continue
+        [[ $svc == openclaw-gateway*.service ]] || continue
+        [[ $svc == openclaw-gateway.service || $svc =~ ^openclaw-gateway-[a-zA-Z0-9_-]+\.service$ ]] || die '发现无法识别的 Gateway 服务'
+        profile=${svc#openclaw-gateway-}; profile=${profile%.service}
+        [[ $svc != openclaw-gateway.service ]] || profile=default
+        [[ $profile != "$exclude" ]] || continue
+        status=$(oc_for "$profile" gateway status --json --no-probe 2>/dev/null) || die "无法检查已有服务: $svc"
+        base=$(jq -er '.gateway.port' <<<"$status") || die "已有服务端口未知: $svc"
+        [[ $base =~ ^[1-9][0-9]{0,4}$ ]] || die '已有服务端口无效'
+        ((base<=65425)) || die '已有服务端口无效'
+        add_range "$base" "$((base+110))" || die '已有服务端口无效'
+    done <<<"$services"
+    output=$(ss -H -lntu) || die '无法读取 IPv4/IPv6 TCP/UDP 监听端口'
+    while read -r line; do
+        [[ -n $line ]] || continue
+        read -r -a columns <<<"$line"
+        base=${columns[4]##*:}
+        [[ $base =~ ^[0-9]+$ ]] || die '无法解析 ss 端口输出'
+        add_range "$base" "$base"
+    done <<<"$output"
+}
+range_free() { jq -e --argjson p "$1" 'all(.[]; .b < $p or .a > ($p+199))' <<<"$ranges" >/dev/null; }
+allocate_port() {
+    local p
+    for ((p=19000;p+199<=65535;p+=200)); do if range_free "$p"; then printf '%s\n' "$p"; return; fi; done
+    return 1
+}
+
+service_info() {
+    systemctl --user show "$unit" --no-pager \
+        -p LoadState -p ActiveState -p MainPID -p ControlPID -p FragmentPath -p DropInPaths 2>/dev/null
+}
+property() { sed -n "s/^$1=//p" <<<"$service_data"; }
+fingerprint() {
+    local path drops
+    service_data=$(service_info) || return 1
+    path=$(property FragmentPath); drops=$(property DropInPaths)
+    [[ $path == "$user_home/.config/systemd/user/$unit" && -z $drops && -f $path ]] || return 1
+    safe_path "$path" || return 1
+    sha256sum -- "$path" | cut -d ' ' -f1
+}
+service_absent() {
+    service_data=$(service_info) || return 1
+    [[ $(property LoadState) == not-found && $(property MainPID) == 0 && $(property ControlPID) == 0 ]]
+}
+service_stopped() {
+    service_data=$(service_info) || return 1
+    [[ $(property ActiveState) =~ ^(inactive|failed)$ && $(property MainPID) == 0 && $(property ControlPID) == 0 ]]
+}
+verify_owned_path() {
+    local expected
+    safe_path "$state" || return 1
+    [[ ! -e $state ]] && return 0
+    [[ -d $state ]] && private_path "$state" || return 1
+    expected=$(entry | jq -r .ownerId)
+    [[ -f $state/.instance-manager-owner ]] && private_path "$state/.instance-manager-owner" || return 1
+    [[ $(cat -- "$state/.instance-manager-owner") == "$expected" ]] || return 1
+    local path
+    for path in "$state/openclaw.json" "$state/workspace" "$state/logs" "$state/logs/openclaw.log"; do safe_path "$path" || return 1; done
+}
+verify_service() {
+    local saved actual
+    if service_absent; then return 0; fi
+    saved=$(entry | jq -r '.serviceFingerprint // empty')
+    [[ -n $saved ]] || return 1
+    actual=$(fingerprint) || return 1
+    [[ $actual == "$saved" ]]
+}
+capture_service() {
+    local snapshot hash
+    snapshot=$(oc gateway status --json --no-probe 2>/dev/null) || return 1
+    jq -e --arg config "$state/openclaw.json" --argjson p "$port" '
+       .config.cli.path==$config and .config.daemon.path==$config and
+       .config.mismatch!=true and .gateway.port==$p and
+       (.service.command.programArguments | type=="array")
+    ' <<<"$snapshot" >/dev/null || return 1
+    hash=$(fingerprint) || return 1
+    atomic_registry --arg n "$name" --arg hash "$hash" '.instances[$n].serviceFingerprint=$hash'
+}
+verify_config() {
+    local gateway agents logging browser derived low high
+    [[ -f $state/openclaw.json ]] && private_path "$state/openclaw.json" || return 1
+    gateway=$(config_part "$name" gateway) || return 1
+    agents=$(config_part "$name" agents) || return 1
+    logging=$(config_part "$name" logging) || return 1
+    browser=$(config_part "$name" browser) || return 1
+    jq -e --argjson p "$port" '.port==$p and .mode=="local" and .bind=="loopback" and .auth.mode=="token" and (.auth.token|type=="string" and length>0) and (.remote.url // "")==""' <<<"$gateway" >/dev/null || return 1
+    jq -e --arg w "$state/workspace" '.defaults.workspace==$w and all(.list[]?; (.workspace==null or .workspace==$w))' <<<"$agents" >/dev/null || return 1
+    jq -e --arg f "$state/logs/openclaw.log" '.file==$f and .maxFileBytes==20971520' <<<"$logging" >/dev/null || return 1
+    derived=$(browser_ranges <<<"$browser") || return 1
+    while read -r low high; do [[ -z $low ]] || ((low>=port && high<=port+199)) || return 1; done <<<"$derived"
+}
+load_entry() {
+    record=$(entry) || die '该实例不在注册表中，拒绝操作'
+    port=$(jq -r .port <<<"$record")
+    verify_owned_path || die '实例路径、所有者标记或权限异常，拒绝操作'
+}
+guard() {
+    verify_service || die '服务身份或定义发生变化，拒绝操作；请检查 serviceFingerprint 与服务文件'
+    verify_config || die '实例配置不完整或端口/路径/认证约束发生变化，拒绝操作'
+}
+health() {
+    local result
+    result=$(timeout "${1:-8}" openclaw --profile "$name" gateway health --port "$port" --timeout 3000 --json 2>/dev/null) || return 1
+    jq -e '.ok==true' <<<"$result" >/dev/null 2>&1
+}
+wait_healthy() {
+    local deadline=$((SECONDS+60)) remaining
+    while ((SECONDS<deadline)); do
+        remaining=$((deadline-SECONDS)); ((remaining<=8)) || remaining=8
+        service_data=$(service_info) || return 1
+        if [[ $(property ActiveState) == active ]] && health "$remaining"; then return 0; fi
+        ((SECONDS<deadline)) && sleep 1
+    done
+    return 1
+}
+stop_service() {
+    if service_absent; then return 0; fi
+    verify_service || return 1
+    # Explicit manager stop/remove/purge authorizes this exact verified service.
+    oc gateway stop --force >/dev/null 2>&1 || return 1
+    service_stopped
+}
+uninstall_service() {
+    if service_absent; then return 0; fi
+    stop_service || return 1
+    oc gateway uninstall >/dev/null 2>&1 || return 1
+    service_absent
+}
+
+# Failed creation never removes data. Only a proven newly installed service is undone.
+creating=0
+install_attempted=0
+mutation_started=0
+on_exit() {
+    local rc=$? cleanup=not-needed phase
+    trap - EXIT INT TERM
+    if ((rc!=0 && creating)); then
+        set +e
+        if ((install_attempted)); then
+            cleanup=failed
+            if verify_owned_path && { verify_service || capture_service; } && uninstall_service; then cleanup=complete; fi
+        fi
+        phase=$(entry | jq -r .stage)
+        atomic_registry --arg n "$name" --arg phase "$phase" --arg cleanup "$cleanup" \
+            '.instances[$n].state="failed" | .instances[$n].lastError={code:"CREATE_FAILED",stage:$phase,cleanup:$cleanup}'
+        note "创建失败，数据与端口已保留；服务清理: $cleanup。请运行 doctor/logs 检查。"
+    elif ((rc!=0 && mutation_started)); then
+        set +e
+        if validate_registry; then
+            phase=$(entry | jq -r .stage)
+            atomic_registry --arg n "$name" --arg phase "$phase" \
+                '.instances[$n].lastError={code:"OPERATION_FAILED",stage:$phase}'
+        fi
+    fi
+    exit "$rc"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+create_instance() {
+    local existing owner_id patch_json
+    if existing=$(entry); then
+        if [[ $(jq -r .state <<<"$existing") == ready ]]; then
+            note '实例已存在；配置和凭据未修改。'
+            load_entry; show_status; return
+        fi
+        die '实例已有未完成、失败或已移除记录；请检查后 start 恢复，或显式 purge 后重建'
+    fi
+    [[ ! -e $state && ! -L $state ]] || die '存在未受管同名目录，拒绝认领'
+    service_absent || die '存在同名服务或无法确认服务不存在'
+    scan_ports
+    port=$(allocate_port) || die '无可用端口区间'
+    owner_id=$(node -e 'process.stdout.write(require("node:crypto").randomBytes(16).toString("hex"))')
+    atomic_registry --arg n "$name" --arg owner "$owner" --argjson uid "$EUID" \
+        --arg state "$state" --arg service "$unit" --argjson port "$port" \
+        --arg version "$version" --arg id "$owner_id" --arg time "$(date -u +%FT%TZ)" '
+        .instances[$n]={profile:$n,owner:$owner,uid:$uid,stateDir:$state,workspace:($state+"/workspace"),
+          configPath:($state+"/openclaw.json"),service:$service,port:$port,portEnd:($port+199),
+          createdAt:$time,openclawVersion:$version,ownerId:$id,state:"creating",stage:"reserved",
+          configComplete:false,serviceFingerprint:null,lastError:null}'
+    creating=1
+    record_stage initializing
+    mkdir -- "$state"
+    printf '%s\n' "$owner_id" >"$state/.instance-manager-owner"
+    oc setup --baseline --workspace "$state/workspace" >/dev/null 2>&1
+    mkdir -p -- "$state/logs"
+    record_stage configuring
+    # Token travels only over stdin, never process arguments or logs.
+    patch_json=$(node - "$state" "$port" <<'JS'
+const [root, port] = process.argv.slice(2);
+console.log(JSON.stringify({gateway:{mode:'local',bind:'loopback',port:Number(port),remote:null,
+  auth:{mode:'token',token:require('node:crypto').randomBytes(32).toString('hex')}},
+  agents:{defaults:{workspace:root+'/workspace'}},
+  logging:{file:root+'/logs/openclaw.log',maxFileBytes:20971520}}));
+JS
+    )
+    printf '%s' "$patch_json" | oc config patch --stdin >/dev/null 2>&1
+    unset patch_json
+    chmod 600 -- "$state/openclaw.json"
+    oc config validate --json >/dev/null 2>&1
+    verify_config
+    atomic_registry --arg n "$name" '.instances[$n].configComplete=true'
+    record_stage installing
+    install_attempted=1
+    oc gateway install --port "$port" >/dev/null 2>&1
+    capture_service
+    record_stage checking-health
+    wait_healthy
+    record_state ready complete
+    creating=0
+    show_status
+    note "配置模型和渠道: openclaw-instance configure $name"
+}
+show_status() {
+    local current service_status=unknown gateway_status=not-checked drift='[]' output
+    current=$(entry) || return 1
+    if ! verify_owned_path; then drift=$(jq -c '.+["path-or-owner"]' <<<"$drift"); fi
+    if ! verify_service; then drift=$(jq -c '.+["service-identity"]' <<<"$drift"); fi
+    if ! verify_config; then drift=$(jq -c '.+["config"]' <<<"$drift"); fi
+    if service_data=$(service_info); then
+        service_status=$(property ActiveState)
+        [[ $(property LoadState) != not-found ]] || service_status=not-installed
+    fi
+    if [[ $drift == '[]' && $service_status == active ]]; then
+        if health; then gateway_status=healthy; else gateway_status=unhealthy; fi
+    fi
+    output=$(jq -c --arg service "$service_status" --arg health "$gateway_status" --argjson drift "$drift" \
+        '. + {serviceStatus:$service,gatewayHealth:$health,drift:$drift,
+          businessStatus:"待单独验证模型和渠道；Gateway 健康不代表业务可用"}' <<<"$current")
+    if [[ ${json_output:-0} == 1 ]]; then printf '%s\n' "$output"; else
+        jq -r '"Profile: \(.profile)\n管理状态: \(.state) / \(.stage)\n服务: \(.serviceStatus)\nGateway: \(.gatewayHealth)\n配置偏差: \(.drift|join(", "))\n端口: \(.port)–\(.portEnd)\n目录: \(.stateDir)\n业务: \(.businessStatus)"' <<<"$output"
+    fi
+    status_ok=0
+    [[ $drift == '[]' && $gateway_status == healthy ]] && status_ok=1
+    return 0
+}
+purge_instance() {
+    local path tree_list mounted=0
+    verify_service || die '服务身份不符，拒绝清理'
+    # Partially initialized instances have no operational config to validate.
+    if [[ -f $state/openclaw.json && $(entry | jq -r .configComplete) == true ]]; then
+        verify_config || die '配置发生偏移，拒绝自动删除'
+    fi
+    # rm never traverses symlinks, and mounted subtrees are explicitly refused.
+    if [[ -d $state ]]; then
+        tree_list=$(mktemp "$manager/.tree.XXXXXX")
+        if ! find "$state" -type d -print0 >"$tree_list"; then
+            rm -f -- "$tree_list"
+            die '无法完整检查实例目录，拒绝删除'
+        fi
+        while IFS= read -r -d '' path; do
+            if mountpoint -q -- "$path"; then mounted=1; break; fi
+        done <"$tree_list"
+        rm -f -- "$tree_list"
+        ((mounted==0)) || die '实例包含挂载点，拒绝自动删除'
+    fi
+    record_stage uninstalling
+    uninstall_service || die '无法确认服务已停止并卸载，数据保持不变'
+    # Refuse deletion while any listener still occupies the reserved block.
+    local listening
+    listening=$(ss -H -lntu) || die '无法确认端口已释放'
+    if awk -v p="$port" '{split($5,a,":"); n=a[length(a)]+0; if(n>=p && n<=p+199) found=1} END{exit !found}' <<<"$listening"; then
+        die '预留端口仍有监听进程，拒绝删除数据'
+    fi
+    record_state deleting deleting-data
+    verify_owned_path || die '删除前路径复查失败'
+    if [[ -d $state ]]; then
+        # Keep the ownership marker until every other entry is removed, so a
+        # partial deletion can be retried without weakening identity checks.
+        find "$state" -mindepth 1 -maxdepth 1 ! -name .instance-manager-owner \
+            -exec rm -rf --one-file-system -- {} + || die '数据删除不完整；保留所有者标记、记录和端口，可修复权限后重试'
+        local marker
+        marker=$(cat -- "$state/.instance-manager-owner")
+        rm -- "$state/.instance-manager-owner"
+        if ! rmdir -- "$state"; then
+            printf '%s\n' "$marker" >"$state/.instance-manager-owner"
+            die '目录未能移除，已保留所有者标记，可重试'
+        fi
+    fi
+    [[ ! -e $state && ! -L $state ]] || die '数据未完全删除；保留注册记录和端口'
+    atomic_registry --arg n "$name" 'del(.instances[$n])'
+    note '实例已永久删除，端口预留已释放。'
+}
+
+json_output=0
+[[ ${*: -1} != --json ]] || json_output=1
+case $command_name in
+    preflight)
+        runtime_check; capabilities
+        [[ ! -e $manager ]] || require_registry
+        scan_ports
+        jq -n --arg version "$version" --arg owner "$owner" --arg dir "$manager" --argjson ranges "$ranges" \
+            '{ok:true,openclawVersion:$version,owner:$owner,managerDir:$dir,reservedOrOccupiedRanges:$ranges}'
+        ;;
+    list|status|doctor|logs)
+        if [[ $command_name == list && ! -e $manager ]]; then
+            if ((json_output)); then printf '[]\n'; else note '尚无受管实例。'; fi
+            exit 0
+        fi
+        require_registry
+        if [[ $command_name == list ]]; then
+            items='[]'
+            while IFS= read -r name; do
+                state="$user_home/.openclaw-$name"; unit="openclaw-gateway-$name.service"
+                port=$(entry | jq -r .port)
+                item=$(json_output=1 show_status)
+                items=$(jq -c --argjson item "$item" '.+[$item]' <<<"$items")
+            done < <(jq -r '.instances | keys[]' "$registry")
+            if ((json_output)); then printf '%s\n' "$items"; else
+                printf 'PROFILE\t管理状态\t服务\tGATEWAY\tPORT\n'
+                jq -r '.[] | [.profile,.state,.serviceStatus,.gatewayHealth,.port] | @tsv' <<<"$items"
+            fi
+        else
+            record=$(entry) || die '该实例未受管'
+            port=$(jq -r .port <<<"$record")
+            if [[ $command_name == logs ]]; then
+                verify_owned_path || die '日志路径不安全'
+                log="$state/logs/openclaw.log"
+                [[ -f $log ]] || die '尚无日志文件'
+                if [[ ${2:-} == -f ]]; then tail -n 100 -F -- "$log"; else tail -n 100 -- "$log"; fi
+            else
+                show_status
+                [[ $command_name != doctor ]] || ((status_ok))
+            fi
+        fi
+        ;;
+    *)
+        runtime_check
+        [[ $command_name != configure || ( -t 0 && -t 1 ) ]] || die 'configure 需要交互终端'
+        if [[ $command_name == create ]]; then capabilities; init_manager; else
+            require_registry
+            safe_path "$manager/manager.lock" || die '锁文件不安全'
+            exec 9>>"$manager/manager.lock"
+        fi
+        lock_instance
+        if [[ $command_name == create ]]; then create_instance; exit 0; fi
+        load_entry
+        case $command_name in
+            purge) purge_instance ;;
+            remove)
+                guard; record_stage removing
+                uninstall_service || die '卸载未完成；数据和端口保留，可重试'
+                record_state removed complete
+                ;;
+            stop)
+                guard; record_stage stopping
+                stop_service || die '停止未完成；请检查服务状态'
+                record_stage complete
+                ;;
+            start|restart)
+                [[ $(entry | jq -r .state) =~ ^(ready|removed)$ ]] || die '未完成或失败的创建不能启动；请检查后清理重建'
+                guard
+                if [[ $command_name == restart ]]; then record_stage stopping; stop_service || die '停止失败'; fi
+                if ! service_absent; then
+                    service_data=$(service_info)
+                    if [[ $(property ActiveState) == active ]]; then
+                        wait_healthy || die '服务运行中，但 Gateway 健康检查未通过'
+                        record_state ready complete
+                        show_status; exit 0
+                    fi
+                fi
+                scan_ports "$name"; range_free "$port" || die '预留端口区间已被其他资源占用'
+                record_stage starting
+                if service_absent; then
+                    if ! oc gateway install --port "$port" >/dev/null 2>&1; then
+                        capture_service || true
+                        die '服务安装失败，数据已保留'
+                    fi
+                    capture_service || die '无法验证新服务身份'
+                else oc gateway start >/dev/null 2>&1 || die '服务启动失败'; fi
+                wait_healthy || die 'Gateway 在 60 秒内未通过健康检查'
+                record_state ready complete
+                show_status
+                ;;
+            configure)
+                guard
+                # Instance lock remains held; other instances can be managed concurrently.
+                flock -u 9
+                result=0
+                openclaw --profile "$name" configure || result=$?
+                flock -x 9
+                require_registry
+                guard
+                ((result==0)) || die '配置流程取消或失败；请检查实际配置'
+                note "配置已检查；如需重启请执行: openclaw-instance restart $name"
+                ;;
+        esac
+        ;;
+esac
